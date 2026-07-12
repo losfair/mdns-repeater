@@ -32,12 +32,14 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <ifaddrs.h>
 
 #define PACKAGE "mdns-repeater"
 #define MDNS_ADDR "224.0.0.251"
 #define MDNS_PORT 5353
 
 #define PIDFILE "/var/run/" PACKAGE ".pid"
+#define MAX_INTERFACES 5
 
 struct if_sock {
 	const char *ifname;		/* interface name  */
@@ -50,15 +52,16 @@ struct if_sock {
 int server_sockfd = -1;
 
 int num_socks = 0;
-struct if_sock socks[5];
+struct if_sock socks[MAX_INTERFACES];
 
 #define PACKET_SIZE 65536
 void *pkt_data = NULL;
 
 int foreground = 0;
-int shutdown_flag = 0;
+volatile sig_atomic_t shutdown_flag = 0;
 
 char *pid_file = PIDFILE;
+int pidfile_created = 0;
 
 void log_message(int loglevel, char *fmt_str, ...) {
 	va_list ap;
@@ -118,6 +121,36 @@ static int create_recv_sock() {
 	return sd;
 }
 
+static int get_interface_info(const char *ifname, struct if_sock *sockdata) {
+	struct ifaddrs *ifaddrs, *ifa;
+	int found = 0;
+
+	if (getifaddrs(&ifaddrs) == -1) {
+		log_message(LOG_ERR, "getifaddrs(): %m");
+		return -1;
+	}
+
+	for (ifa = ifaddrs; ifa != NULL; ifa = ifa->ifa_next) {
+		if (ifa->ifa_addr == NULL || ifa->ifa_netmask == NULL ||
+		    ifa->ifa_addr->sa_family != AF_INET ||
+		    strcmp(ifa->ifa_name, ifname) != 0)
+			continue;
+
+		sockdata->addr = ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
+		sockdata->mask = ((struct sockaddr_in *)ifa->ifa_netmask)->sin_addr;
+		found = 1;
+		break;
+	}
+
+	freeifaddrs(ifaddrs);
+	if (!found) {
+		log_message(LOG_ERR, "interface %s has no IPv4 address", ifname);
+		return -1;
+	}
+
+	return 0;
+}
+
 static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock *sockdata) {
 	int sd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sd < 0) {
@@ -130,27 +163,22 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 
 	int r = -1;
 
-	struct ifreq ifr;
-	memset(&ifr, 0, sizeof(ifr));
-	strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
-	struct in_addr *if_addr = &((struct sockaddr_in *) &ifr.ifr_addr)->sin_addr;
+	if (get_interface_info(ifname, sockdata) == -1)
+		return -1;
 
 #ifdef SO_BINDTODEVICE
-	if ((r = setsockopt(sd, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(struct ifreq))) < 0) {
+	struct ifreq ifr;
+	memset(&ifr, 0, sizeof(ifr));
+	if (strlen(ifname) >= sizeof(ifr.ifr_name)) {
+		log_message(LOG_ERR, "interface name %s is too long", ifname);
+		return -1;
+	}
+	strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
+	if ((r = setsockopt(sd, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr))) < 0) {
 		log_message(LOG_ERR, "send setsockopt(SO_BINDTODEVICE): %m");
 		return r;
 	}
 #endif
-
-	// get netmask
-	if (ioctl(sd, SIOCGIFNETMASK, &ifr) == 0) {
-		memcpy(&sockdata->mask, if_addr, sizeof(struct in_addr));
-	}
-
-	// .. and interface address
-	if (ioctl(sd, SIOCGIFADDR, &ifr) == 0) {
-		memcpy(&sockdata->addr, if_addr, sizeof(struct in_addr));
-	}
 
 	// compute network (address & mask)
 	sockdata->net.s_addr = sockdata->addr.s_addr & sockdata->mask.s_addr;
@@ -166,7 +194,7 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 	memset(&serveraddr, 0, sizeof(serveraddr));
 	serveraddr.sin_family = AF_INET;
 	serveraddr.sin_port = htons(MDNS_PORT);
-	serveraddr.sin_addr.s_addr = if_addr->s_addr;
+	serveraddr.sin_addr.s_addr = sockdata->addr.s_addr;
 	if ((r = bind(sd, (struct sockaddr *)&serveraddr, sizeof(serveraddr))) < 0) {
 		log_message(LOG_ERR, "send bind(): %m");
 	}
@@ -174,7 +202,7 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 	// add membership to receiving socket
 	struct ip_mreq mreq;
 	memset(&mreq, 0, sizeof(struct ip_mreq));
-	mreq.imr_interface.s_addr = if_addr->s_addr;
+	mreq.imr_interface.s_addr = sockdata->addr.s_addr;
 	mreq.imr_multiaddr.s_addr = inet_addr(MDNS_ADDR);
 	if ((r = setsockopt(recv_sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq))) < 0) {
 		log_message(LOG_ERR, "recv setsockopt(IP_ADD_MEMBERSHIP): %m");
@@ -194,7 +222,7 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 		return r;
 	}
 	
-        if ((r = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_IF, &if_addr->s_addr, sizeof(if_addr->s_addr))) < 0) {
+        if ((r = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_IF, &sockdata->addr, sizeof(sockdata->addr))) < 0) {
 		log_message(LOG_ERR, "send setsockopt(IP_MULTICAST_IF): %m");
 		return r;
 	}
@@ -202,7 +230,7 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 	char *addr_str = strdup(inet_ntoa(sockdata->addr));
 	char *mask_str = strdup(inet_ntoa(sockdata->mask));
 	char *net_str  = strdup(inet_ntoa(sockdata->net));
-	log_message(LOG_INFO, "dev %s addr %s mask %s net %s", ifr.ifr_name, addr_str, mask_str, net_str);
+	log_message(LOG_INFO, "dev %s addr %s mask %s net %s", ifname, addr_str, mask_str, net_str);
 	free(addr_str);
 	free(mask_str);
 	free(net_str);
@@ -223,6 +251,7 @@ static ssize_t send_packet(int fd, const void *data, size_t len) {
 }
 
 static void mdns_repeater_shutdown(int sig) {
+	(void)sig;
 	shutdown_flag = 1;
 }
 
@@ -259,7 +288,6 @@ static int write_pidfile() {
 }
 
 static void daemonize() {
-	pid_t running_pid;
 	pid_t pid = fork();
 	if (pid < 0) {
 		log_message(LOG_ERR, "fork(): %m");
@@ -289,15 +317,73 @@ static void daemonize() {
 		}
 	}
 
-	// check for pid file
-	running_pid = already_running();
-	if (running_pid != -1) {
-		log_message(LOG_ERR, "already running as pid %d", running_pid);
-		exit(1);
-	} else if (! write_pidfile()) {
-		log_message(LOG_ERR, "unable to write pid file %s", pid_file);
+}
+
+/*
+ * Enter the sandbox in stages.  Daemon setup still needs process and path
+ * operations; after the pid file and sockets have been set up, only packet
+ * I/O and removal of a pid file created by this process remain.
+ */
+static void sandbox_startup(void) {
+#ifdef __OpenBSD__
+	const char *promises;
+
+	if (foreground)
+		promises = "stdio rpath inet mcast proc unveil";
+	else
+		promises = "stdio rpath wpath cpath inet mcast proc unveil";
+
+	if (pledge(promises, NULL) == -1) {
+		log_message(LOG_ERR, "pledge(): %m");
 		exit(1);
 	}
+#endif
+}
+
+static void sandbox_filesystem(void) {
+#ifdef __OpenBSD__
+	const char *permissions = foreground ? "r" : "rwc";
+
+	if (unveil(pid_file, permissions) == -1) {
+		log_message(LOG_ERR, "unveil(%s): %m", pid_file);
+		exit(1);
+	}
+	if (unveil(NULL, NULL) == -1) {
+		log_message(LOG_ERR, "unveil lock: %m");
+		exit(1);
+	}
+
+	/* Drop the unveil promise as well as locking the filesystem view. */
+	if (pledge(foreground ? "stdio rpath inet mcast proc" :
+	    "stdio rpath wpath cpath inet mcast proc", NULL) == -1) {
+		log_message(LOG_ERR, "pledge(): %m");
+		exit(1);
+	}
+#endif
+}
+
+static void sandbox_after_pidfile(void) {
+#ifdef __OpenBSD__
+	const char *promises = foreground ? "stdio inet mcast" :
+	    "stdio cpath inet mcast";
+
+	if (pledge(promises, NULL) == -1) {
+		log_message(LOG_ERR, "pledge(): %m");
+		exit(1);
+	}
+#endif
+}
+
+static void sandbox_runtime(void) {
+#ifdef __OpenBSD__
+	const char *promises = foreground ? "stdio inet" :
+	    "stdio cpath inet";
+
+	if (pledge(promises, NULL) == -1) {
+		log_message(LOG_ERR, "pledge(): %m");
+		exit(1);
+	}
+#endif
 }
 
 static void show_help(const char *progname) {
@@ -363,18 +449,36 @@ int main(int argc, char *argv[]) {
 		log_message(LOG_ERR, "error: at least 2 interfaces must be specified");
 		exit(2);
 	}
+	if ((argc - optind) > MAX_INTERFACES) {
+		show_help(argv[0]);
+		log_message(LOG_ERR, "error: at most %d interfaces may be specified",
+			MAX_INTERFACES);
+		exit(2);
+	}
 
 	openlog(PACKAGE, LOG_PID | LOG_CONS, LOG_DAEMON);
+	sandbox_startup();
+
 	if (! foreground)
 		daemonize();
-	else {
-		// check for pid file when running in foreground
-		running_pid = already_running();
-		if (running_pid != -1) {
-			log_message(LOG_ERR, "already running as pid %d", running_pid);
+
+	sandbox_filesystem();
+
+	// check for pid file
+	running_pid = already_running();
+	if (running_pid != -1) {
+		log_message(LOG_ERR, "already running as pid %d", running_pid);
+		exit(1);
+	}
+	if (! foreground) {
+		if (! write_pidfile()) {
+			log_message(LOG_ERR, "unable to write pid file %s", pid_file);
 			exit(1);
 		}
+		pidfile_created = 1;
 	}
+
+	sandbox_after_pidfile();
 
 	// create receiving socket
 	server_sockfd = create_recv_sock();
@@ -402,6 +506,8 @@ int main(int argc, char *argv[]) {
 		r = 1;
 		goto end_main;
 	}
+
+	sandbox_runtime();
 
 	while (! shutdown_flag) {
 		struct timeval tv = {
@@ -475,8 +581,8 @@ end_main:
 	for (i = 0; i < num_socks; i++) 
 		close(socks[i].sockfd);
 
-	// remove pid file if it belongs to us
-	if (already_running() == getpid())
+	// remove only a pid file created by this process
+	if (pidfile_created)
 		unlink(pid_file);
 
 	log_message(LOG_INFO, "exit.");

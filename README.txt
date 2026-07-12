@@ -1,6 +1,11 @@
 This is a multicast DNS repeater that has been modified to work on OpenBSD.
 It might have broken Linux compatibility however, but it works for me.
 
+On OpenBSD, the daemon uses unveil(2) to expose only its configured pid file
+and pledge(2) to reduce its privileges in stages.  Once initialized, it can
+only perform standard I/O and IPv4 network operations (plus removal of its pid
+file when running in the background).
+
 Original source was obtained from
 https://bitbucket.org/geekman/mdns-repeater/src/28ecc2ab9a0e26c73148711c867d9d2b5dafff91
 
@@ -32,6 +37,22 @@ interface and vlan1 as the WAN interface, I would use:
 
 You can also specify the -f flag for debugging, which prints packets as they 
 are received.
+
+OPENBSD RC.D SERVICE
+--------------------
+An example rc.d(8) service is included in rc.d/mdns_repeater.  It assumes the
+binary is installed as /usr/local/sbin/mdns-repeater.  Install and enable it,
+replacing the example interface names with the interfaces to bridge:
+
+    install -m 0555 rc.d/mdns_repeater /etc/rc.d/mdns_repeater
+    rcctl set mdns_repeater flags em0 vlan10
+    rcctl enable mdns_repeater
+    rcctl start mdns_repeater
+
+The daemon does not support configuration reloads; restart it after changing
+its flags:
+
+    rcctl restart mdns_repeater
 
 You are free to modify the code to repeat whatever traffic you require, as
 long as you abide by the software license.
